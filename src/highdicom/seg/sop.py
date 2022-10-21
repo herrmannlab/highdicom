@@ -99,56 +99,53 @@ class Segmentation(SOPClass):
         """
         Parameters
         ----------
-        source_images: Sequence[Dataset]
+        source_images: Sequence[pydicom.dataset.Dataset]
             One or more single- or multi-frame images (or metadata of images)
-            from which the segmentation was derived
+            from which the segmentation was derived. The images must have the
+            same dimensions (rows, columns) and orientation, have the same frame
+            of reference, and contain the same number of frames.
         pixel_array: numpy.ndarray
             Array of segmentation pixel data of boolean, unsigned integer or
             floating point data type representing a mask image. The array may
             be a 2D, 3D or 4D numpy array.
 
-            If it is a 2D numpy array, it represents the segmentation of a
-            single frame image, such as a planar x-ray or single instance from
-            a CT or MR series.
+            If it is a 2D numpy array, it represents the segmentation of an
+            individual image frame (such as a planar x-ray image, a single
+            plane of a CT or MR image, or a single tile of a SM image).
 
             If it is a 3D array, it represents the segmentation of either a
-            series of source images (such as a series of CT or MR images) a
-            single 3D multi-frame image (such as a multi-frame CT/MR image), or
-            a single 2D tiled image (such as a slide microscopy image).
+            series of single-frame images or a multi-frame image (such as a 3D
+            CT/MR image or a 2D tiled SM image).  If it represents the
+            segmentation of a 3D image, the first dimension represents
+            individual 2D planes.  Similarly, if it represents the segmentation
+            of a tiled 2D image, the first dimension represents individual 2D
+            tiles.  Unless the ``plane_positions`` parameter is provided, the
+            frame in ``pixel_array[i, ...]`` should correspond to either
+            ``source_images[i]`` (if `source_images` contains single-frame
+            images) or ``source_images[0].pixel_array[i, ...]`` (if
+            `source_images` contains multi-frame images).
 
-            If ``pixel_array`` represents the segmentation of a 3D image, the
-            first dimension represents individual 2D planes. Unless the
-            ``plane_positions`` parameter is provided, the frame in
-            ``pixel_array[i, ...]`` should correspond to either
-            ``source_images[i]`` (if ``source_images`` is a list of single
-            frame instances) or source_images[0].pixel_array[i, ...] if
-            ``source_images`` is a single multiframe instance.
-
-            Similarly, if ``pixel_array`` is a 3D array representing the
-            segmentation of a tiled 2D image, the first dimension represents
-            individual 2D tiles (for one channel and z-stack) and these tiles
-            correspond to the frames in the source image dataset.
-
-            If ``pixel_array`` is an unsigned integer or boolean array with
+            If `pixel_array` is an unsigned integer or boolean array with
             binary data (containing only the values ``True`` and ``False`` or
             ``0`` and ``1``) or a floating-point array, it represents a single
             segment. In the case of a floating-point array, values must be in
             the range 0.0 to 1.0.
 
-            Otherwise, if ``pixel_array`` is a 2D or 3D array containing multiple
-            unsigned integer values, each value is treated as a different
-            segment whose segment number is that integer value. This is
-            referred to as a *label map* style segmentation.  In this case, all
-            segments from 1 through ``pixel_array.max()`` (inclusive) must be
-            described in `segment_descriptions`, regardless of whether they are
-            present in the image.  Note that this is valid for segmentations
-            encoded using the ``"BINARY"`` or ``"FRACTIONAL"`` methods.
+            Otherwise, if `pixel_array` is a 2D or 3D array containing
+            multiple unsigned integer values, each value is treated as a
+            different segment whose segment number is that integer value. This
+            is referred to as a *label map* style segmentation.  In this case,
+            all segments from 1 through ``pixel_array.max()`` (inclusive) must
+            be described in `segment_descriptions`, regardless of whether they
+            are present in the image.  Note that this is valid for
+            segmentations encoded using the ``"BINARY"`` or ``"FRACTIONAL"``
+            methods.
 
             Note that that a 2D numpy array and a 3D numpy array with a
             single frame along the first dimension may be used interchangeably
             as segmentations of a single frame, regardless of their data type.
 
-            If ``pixel_array`` is a 4D numpy array, the first three dimensions
+            If `pixel_array` is a 4D numpy array, the first three dimensions
             are used in the same way as the 3D case and the fourth dimension
             represents multiple segments. In this case
             ``pixel_array[:, :, :, i]`` represents segment number ``i + 1``
@@ -259,6 +256,7 @@ class Segmentation(SOPClass):
                   and series.
                 * Items of `source_images` have different number of rows and
                   columns.
+                * Items of `source_images` have different image orientation.
                 * Length of `plane_positions` does not match number of segments
                   encoded in `pixel_array`.
                 * Length of `plane_positions` does not match number of 2D planes
@@ -274,29 +272,52 @@ class Segmentation(SOPClass):
         if len(source_images) == 0:
             raise ValueError('At least one source image is required.')
 
+        unique_sop_instance_uids = set(
+            [image.SOPInstanceUID for image in source_images]
+        )
+        if len(source_images) != len(unique_sop_instance_uids):
+            raise ValueError(
+                'Source images must all have a unique SOP Instance UID.'
+            )
+
         uniqueness_criteria = set(
             (
                 image.StudyInstanceUID,
-                image.SeriesInstanceUID,
                 image.Rows,
                 image.Columns,
+                int(getattr(image, 'NumberOfFrames', '1')),
+                hasattr(image, 'FrameOfReferenceUID'),
                 getattr(image, 'FrameOfReferenceUID', None),
+                hasattr(image, 'TotalPixelMatrixRows'),
+                getattr(image, 'TotalPixelMatrixRows', None),
+                hasattr(image, 'TotalPixelMatrixColumns'),
+                getattr(image, 'TotalPixelMatrixColumns', None),
+                hasattr(image, 'TotalPixelMatrixFocalPlanes'),
+                getattr(image, 'TotalPixelMatrixFocalPlanes', None),
+                tuple(getattr(image, 'ImageOrientation', [])),
+                tuple(getattr(image, 'ImageOrientationSlide', [])),
+                hasattr(image, 'DimensionOrganizationType'),
+                getattr(image, 'DimensionOrganizationType', None),
+                len(getattr(image, 'PerFrameFunctionalGroupsSequence', [])),
+                len(getattr(image, 'SharedFunctionalGroupsSequence', [])),
             )
             for image in source_images
         )
         if len(uniqueness_criteria) > 1:
             raise ValueError(
-                'Source images must all be part of the same series and must '
-                'have the same image dimensions (number of rows/columns).'
+                'Source images must all have the same image dimensions '
+                '(number of rows/columns) and image orientation, '
+                'have the same frame of reference, '
+                'and contain the same number of frames.'
             )
+
+        if pixel_array.ndim == 2:
+            pixel_array = pixel_array[np.newaxis, ...]
+        if pixel_array.ndim not in [3, 4]:
+            raise ValueError('Pixel array must be a 2D, 3D, or 4D array.')
 
         src_img = source_images[0]
         is_multiframe = hasattr(src_img, 'NumberOfFrames')
-        if is_multiframe and len(source_images) > 1:
-            raise ValueError(
-                'Only one source image should be provided in case images '
-                'are multi-frame images.'
-            )
         is_tiled = hasattr(src_img, 'TotalPixelMatrixRows')
         supported_transfer_syntaxes = {
             ImplicitVRLittleEndian,
@@ -309,11 +330,6 @@ class Segmentation(SOPClass):
             raise ValueError(
                 f'Transfer syntax "{transfer_syntax_uid}" is not supported.'
             )
-
-        if pixel_array.ndim == 2:
-            pixel_array = pixel_array[np.newaxis, ...]
-        if pixel_array.ndim not in [3, 4]:
-            raise ValueError('Pixel array must be a 2D, 3D, or 4D array.')
 
         super().__init__(
             study_instance_uid=src_img.StudyInstanceUID,
@@ -341,6 +357,49 @@ class Segmentation(SOPClass):
             software_versions=software_versions,
             **kwargs
         )
+
+        # General Reference
+        self.SourceImageSequence: List[Dataset] = []
+        referenced_series: Dict[str, List[Dataset]] = defaultdict(list)
+        for img in source_images:
+            if is_multiframe and plane_positions is None:
+                num_frames = int(getattr(img, 'NumberOfFrames', '1'))
+                if num_frames != pixel_array.shape[0]:
+                    raise ValueError(
+                        'If source images are multiple-frame images, then '
+                        f'each image must contain n={pixel_array.shape[0]} '
+                        f'frames. However, image "{img.SOPInstanceUID}" '
+                        f'contains n={num_frames} frames.'
+                    )
+            ref = Dataset()
+            ref.ReferencedSOPClassUID = img.SOPClassUID
+            ref.ReferencedSOPInstanceUID = img.SOPInstanceUID
+            self.SourceImageSequence.append(ref)
+            referenced_series[img.SeriesInstanceUID].append(ref)
+
+        if len(referenced_series) > 1:
+            if not is_multiframe:
+                raise ValueError(
+                    'If source images are single-frame images, then all '
+                    'source images must be from a single series.'
+                )
+
+        # Common Instance Reference
+        self.ReferencedSeriesSequence: List[Dataset] = []
+        for series_instance_uid, referenced_images in referenced_series.items():
+            if not is_multiframe and plane_positions is None:
+                if len(referenced_images) != pixel_array.shape[0]:
+                    raise ValueError(
+                        'If source images are single-frame images, then '
+                        f'then n={pixel_array.shape[0]} source images must be '
+                        'provided per series. '
+                        f'However, n={len(referenced_images)} images were '
+                        f'provided for series "{series_instance_uid}".'
+                    )
+            ref = Dataset()
+            ref.SeriesInstanceUID = series_instance_uid
+            ref.ReferencedInstanceSequence = list(referenced_images)
+            self.ReferencedSeriesSequence.append(ref)
 
         # Frame of Reference
         has_ref_frame_uid = hasattr(src_img, 'FrameOfReferenceUID')
@@ -394,24 +453,6 @@ class Segmentation(SOPClass):
                     "with the source images."
                 )
             self._coordinate_system = None
-
-        # General Reference
-        self.SourceImageSequence: List[Dataset] = []
-        referenced_series: Dict[str, List[Dataset]] = defaultdict(list)
-        for s_img in source_images:
-            ref = Dataset()
-            ref.ReferencedSOPClassUID = s_img.SOPClassUID
-            ref.ReferencedSOPInstanceUID = s_img.SOPInstanceUID
-            self.SourceImageSequence.append(ref)
-            referenced_series[s_img.SeriesInstanceUID].append(ref)
-
-        # Common Instance Reference
-        self.ReferencedSeriesSequence: List[Dataset] = []
-        for series_instance_uid, referenced_images in referenced_series.items():
-            ref = Dataset()
-            ref.SeriesInstanceUID = series_instance_uid
-            ref.ReferencedInstanceSequence = referenced_images
-            self.ReferencedSeriesSequence.append(ref)
 
         # Image Pixel
         self.Rows = pixel_array.shape[1]
@@ -742,6 +783,8 @@ class Segmentation(SOPClass):
             # bitpacking at the end
             full_pixel_array = np.array([], np.bool_)
 
+        derivation_code = codes.cid7203.Segmentation
+        purpose_code = codes.cid7202.SourceImageForImageProcessingOperation
         for i, segment_number in enumerate(described_segment_numbers):
             # Pixel array for just this segment
             if pixel_array.dtype in (np.float_, np.float32, np.float64):
@@ -787,17 +830,11 @@ class Segmentation(SOPClass):
                 # absent. Such frames should be removed
                 if omit_empty_frames and np.sum(planes[j]) == 0:
                     logger.info(
-                        'skip empty plane {} of segment #{}'.format(
-                            j, segment_number
-                        )
+                        f'skip empty plane {j} of segment #{segment_number}'
                     )
                     continue
                 contained_plane_index.append(j)
-                logger.info(
-                    'add plane #{} for segment #{}'.format(
-                        j, segment_number
-                    )
-                )
+                logger.info(f'add plane #{j} for segment #{segment_number}')
 
                 pffp_item = Dataset()
                 frame_content_item = Dataset()
@@ -837,9 +874,9 @@ class Segmentation(SOPClass):
                             ]
                     except IndexError as error:
                         raise IndexError(
-                            'Could not determine position of plane #{} in '
+                            f'Could not determine position of plane #{j} in '
                             'three dimensional coordinate system based on '
-                            'dimension index values: {}'.format(j, error)
+                            f'dimension index values: {error}'
                         )
                 frame_content_item.DimensionIndexValues = (
                     [segment_number] + index_values
@@ -858,43 +895,49 @@ class Segmentation(SOPClass):
                 pffp_item.DerivationImageSequence = []
 
                 if are_spatial_locations_preserved:
-                    derivation_image_item = Dataset()
-                    derivation_code = codes.cid7203.Segmentation
-                    derivation_image_item.DerivationCodeSequence = [
+                    derivation_img_item = Dataset()
+                    derivation_img_item.DerivationCodeSequence = [
                         CodedConcept.from_code(derivation_code)
                     ]
+                    derivation_img_item.SourceImageSequence = []
 
-                    derivation_src_img_item = Dataset()
-                    if hasattr(source_images[0], 'NumberOfFrames'):
-                        # A single multi-frame source image
-                        src_img_item = self.SourceImageSequence[0]
-                        # Frame numbers are one-based
-                        derivation_src_img_item.ReferencedFrameNumber = (
-                            source_image_index + 1
-                        )
-                    else:
-                        # Multiple single-frame source images
-                        src_img_item = self.SourceImageSequence[
-                            source_image_index
-                        ]
-                    derivation_src_img_item.ReferencedSOPClassUID = \
-                        src_img_item.ReferencedSOPClassUID
-                    derivation_src_img_item.ReferencedSOPInstanceUID = \
-                        src_img_item.ReferencedSOPInstanceUID
-                    purpose_code = \
-                        codes.cid7202.SourceImageForImageProcessingOperation
-                    derivation_src_img_item.PurposeOfReferenceCodeSequence = [
-                        CodedConcept.from_code(purpose_code)
-                    ]
-                    derivation_src_img_item.SpatialLocationsPreserved = 'YES'
-                    derivation_image_item.SourceImageSequence = [
-                        derivation_src_img_item,
-                    ]
+                    for _, referenced_images in referenced_series.items():
+                        if is_multiframe:
+                            for src_item in referenced_images:
+                                drv_src_item = Dataset()
+                                drv_src_item.ReferencedFrameNumber = (
+                                    source_image_index + 1
+                                )
+                                drv_src_item.ReferencedSOPClassUID = \
+                                    src_item.ReferencedSOPClassUID
+                                drv_src_item.ReferencedSOPInstanceUID = \
+                                    src_item.ReferencedSOPInstanceUID
+                                drv_src_item.PurposeOfReferenceCodeSequence = [
+                                    CodedConcept.from_code(purpose_code)
+                                ]
+                                drv_src_item.SpatialLocationsPreserved = 'YES'
+                                derivation_img_item.SourceImageSequence.append(
+                                    drv_src_item
+                                )
+                        else:
+                            src_item = referenced_images[source_image_index]
+                            drv_src_item = Dataset()
+                            drv_src_item.ReferencedSOPClassUID = \
+                                src_item.ReferencedSOPClassUID
+                            drv_src_item.ReferencedSOPInstanceUID = \
+                                src_item.ReferencedSOPInstanceUID
+                            drv_src_item.PurposeOfReferenceCodeSequence = [
+                                CodedConcept.from_code(purpose_code)
+                            ]
+                            drv_src_item.SpatialLocationsPreserved = 'YES'
+                            derivation_img_item.SourceImageSequence.append(
+                                drv_src_item
+                            )
                     pffp_item.DerivationImageSequence.append(
-                        derivation_image_item
+                        derivation_img_item
                     )
                 else:
-                    logger.warning('spatial locations not preserved')
+                    logger.warning('spatial locations are not preserved')
 
                 identification = Dataset()
                 identification.ReferencedSegmentNumber = segment_number
